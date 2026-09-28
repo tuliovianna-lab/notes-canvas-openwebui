@@ -1,0 +1,9 @@
+# Local, private files (never published)
+/local/
+
+# Throwaway database created by the integration tests
+/tests/tmp/
+
+# Python
+__pycache__/
+*.pyc
