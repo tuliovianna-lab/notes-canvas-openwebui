@@ -2,7 +2,7 @@
 title: Notes Canvas Activator
 author: Túlio Vianna
 author_url: https://github.com/tuliovianna-lab/notes-canvas-openwebui
-version: 1.0.0
+version: 1.1.0
 license: MIT
 required_open_webui_version: 0.11.0
 description: Companion filter for the "Notes Canvas" tool. It turns the tool on by itself in note chats, with any model, and adds a few short safe-editing rules. Install it as a Function, then enable it and mark it Global.
@@ -21,9 +21,12 @@ description: Companion filter for the "Notes Canvas" tool. It turns the tool on 
 # Notes tools (view_note, replace_note_content), which are thus replaced by
 # the safe ones. Result: it works with whatever model you pick.
 
+import re
+
 from pydantic import BaseModel, Field
 
 NOTE_CHAT_MARKER = "This chat is attached to the current note"
+NOTE_ID_RE = re.compile(r"Current note id:\s*([0-9a-fA-F-]{32,36})")
 
 # Functions that identify the Notes Canvas tool when looking it up by content.
 TOOL_SIGNATURE = {"replace_note_content", "suggest_edits", "apply_suggestions"}
@@ -69,21 +72,38 @@ def enable_tool(body: dict, tool_id: str) -> None:
     body["tool_ids"] = ids
 
 
-async def is_note_chat(body: dict, metadata: dict) -> bool:
-    """A note's side chat: recognised by the built-in instruction or, if needed, by the database."""
-    if NOTE_CHAT_MARKER in _system_text(body):
-        return True
+async def note_of_chat(body: dict, metadata: dict):
+    """
+    For a note's side chat, returns the note id ("" if unknown); for any other
+    chat, None. Recognised by the built-in instruction or, if needed, by the database.
+    """
+    system = _system_text(body)
+    if NOTE_CHAT_MARKER in system:
+        m = NOTE_ID_RE.search(system)
+        return m.group(1) if m else ""
     chat_id = (metadata or {}).get("chat_id")
     if not chat_id:
-        return False
+        return None
     try:
         from open_webui.models.chats import Chats
 
         chat = await Chats.get_chat_by_id(chat_id)
         meta = (chat.meta or {}) if chat else {}
-        return meta.get("internal") is True and meta.get("type") == "note"
+        if meta.get("internal") is True and meta.get("type") == "note":
+            return meta.get("note_id") or ""
     except Exception:
-        return False
+        pass
+    return None
+
+
+def rules_for(note_id: str) -> str:
+    """The rules, plus which note this chat is about (models otherwise pass titles and may pick look-alike notes)."""
+    if not note_id:
+        return RULES
+    return (
+        RULES
+        + f'\n- This chat is about the note with id "{note_id}": always pass note_id="{note_id}" and change only this note.'
+    )
 
 
 def _function_names(specs) -> set:
@@ -141,9 +161,10 @@ class Filter:
         return self._resolved[preferred]
 
     async def inlet(self, body: dict, __metadata__: dict = None, __user__: dict = None) -> dict:
-        note_chat = await is_note_chat(body, __metadata__)
+        note_id = await note_of_chat(body, __metadata__)
+        note_chat = note_id is not None
         if note_chat or self.valves.mode.strip().lower() == "always":
             enable_tool(body, await self._tool_id())
         if note_chat and self.valves.rules:
-            append_rules(body, RULES)
+            append_rules(body, rules_for(note_id))
         return body

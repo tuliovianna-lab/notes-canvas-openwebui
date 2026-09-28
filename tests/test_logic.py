@@ -70,6 +70,16 @@ _stub("open_webui.models.notes", Notes=FakeNotes(), NoteUpdateForm=FakeForm, Not
 _stub("open_webui.models.groups", Groups=None)
 _stub("open_webui.models.access_grants", AccessGrants=None)
 
+CHATS: dict = {}  # chat id -> chat meta
+
+
+class FakeChats:
+    async def get_chat_by_id(self, id):
+        return types.SimpleNamespace(meta=CHATS[id]) if id in CHATS else None
+
+
+_stub("open_webui.models.chats", Chats=FakeChats())
+
 _spec = importlib.util.spec_from_file_location("notes_canvas", ROOT / "src" / "notes_canvas.py")
 C = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(C)
@@ -230,6 +240,10 @@ def tests_cards():
     old_style = '<button data-prompt="Undo &quot;X&quot;">x</button>'
     check(as_open_webui_reads_it(old_style) == "", "reproduces the defect: a card with &quot; disappears (the test catches it)")
 
+    js = C._CARD_JS.strip()
+    check(js.startswith("(function () {") and js.endswith("})();"), "card script runs inside its own function (no clash with browser globals)")
+    check(not any(f"var {g} " in js for g in ("top", "name", "parent", "self", "status", "length", "frames", "opener")), "card script does not reuse browser global names")
+
     hist = C.build_card("H", "s", rows=[["1", "desc", C.button("Restore", 'Restore "X".')]])
     check(as_open_webui_reads_it(hist.body.decode()) == hist.body.decode(), "history card survives too")
 
@@ -318,6 +332,11 @@ async def tests_activator():
     r = await f.inlet(r, __metadata__={})
     check(r["tool_ids"] == ["notes_canvas"] and r["messages"][0]["content"].count("NOTES CANVAS (safe editing") == 1, "does not duplicate when run again")
 
+    nid = "abcdef01-2345-6789-abcd-ef0123456789"
+    body = {"messages": [{"role": "system", "content": f"CONTEXT:\nCurrent note id: {nid}\nThis chat is attached to the current note.\n"}]}
+    r = await f.inlet(body, __metadata__={})
+    check(f'note_id="{nid}"' in r["messages"][0]["content"], "tells the model the id of the chat's note")
+
     plain = {"messages": [{"role": "user", "content": "hi"}], "tool_ids": ["other"]}
     r = await f.inlet(plain, __metadata__={})
     check(r["tool_ids"] == ["other"] and len(r["messages"]) == 1, "regular chat (notes mode): nothing changes")
@@ -384,6 +403,39 @@ async def tests_suggestions():
     check(isinstance(r, tuple) and "Who approves the budget?\n\n- Who signs the contract?" in md(), "insert_text after a passage")
 
 
+async def tests_lock():
+    t, u = C.Tools(), {"id": "u1", "role": "user"}
+    print("Note chat edits only its own note")
+    fresh_db()
+    id_copy = "22222222-2222-3333-4444-555555555555"
+    DB[id_copy] = FakeNote(id_copy, "Project Notes (copy)", PROJECT)
+    CHATS["c1"] = {"internal": True, "type": "note", "note_id": ID_P}
+    CHATS["c2"] = {"tags": []}  # a regular chat
+    edit = [{"old": "Remote.", "new": "On site."}]
+
+    r = await t.replace_note_content(id_copy, edit, __user__=u, __chat_id__="c1")
+    check(isinstance(r, str) and "only that note" in r and ID_P in r, "editing another note from a note chat is refused", str(r))
+    check(DB[id_copy].data["content"]["md"] == PROJECT and md() == PROJECT, "neither note changed")
+    r = await t.suggest_edits("Project Notes (copy)", [{"old": "Remote.", "new": "x"}], __user__=u, __chat_id__="c1")
+    check(isinstance(r, str) and "only that note" in r, "suggestions for another note are refused too")
+
+    r = await t.replace_note_content("A title the model made up", edit, __user__=u, __chat_id__="c1")
+    check(isinstance(r, tuple) and "On site." in md(), "an unknown reference falls back to the chat's note")
+    r = await t.view_note("Another made-up title", __user__=u, __chat_id__="c1")
+    check(f"(id: {ID_P})" in r, "view_note with a wrong reference reads the chat's note")
+    r = await t.view_note(id_copy, __user__=u, __chat_id__="c1")
+    check(f"(id: {id_copy})" in r, "other notes stay readable")
+
+    r = await t.replace_note_content(id_copy, edit, __user__=u, __chat_id__="c2")
+    check(isinstance(r, tuple) and "On site." in DB[id_copy].data["content"]["md"], "a regular chat can edit any note")
+
+    fresh_db()
+    DB[id_copy] = FakeNote(id_copy, "Project Notes (copy)", PROJECT)
+    t.valves.lock_to_current_note = False
+    r = await t.replace_note_content(id_copy, edit, __user__=u, __chat_id__="c1")
+    check(isinstance(r, tuple) and "On site." in DB[id_copy].data["content"]["md"], "with the lock off, a note chat can edit other notes")
+
+
 def main():
     tests_projection()
     tests_anchor()
@@ -393,6 +445,7 @@ def main():
     asyncio.run(tests_activator())
     tests_insert()
     asyncio.run(tests_suggestions())
+    asyncio.run(tests_lock())
     print(f"\n{'ALL OK' if not failures else f'{failures} FAILURE(S)'}")
     sys.exit(1 if failures else 0)
 

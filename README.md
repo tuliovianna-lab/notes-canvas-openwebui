@@ -8,7 +8,8 @@ red and green, and keeps a history so you can undo. **It works with any model** 
 > offsets* ("from 4,817 to 5,203"). Models cannot count characters, so edits miss, or the model ends up
 > deleting and rewriting the whole note. Notes Canvas finds the passage **by its own text**.
 
-This is not a fork. It runs on a regular Open WebUI install (tested on **0.11.4**).
+This is not a fork. It runs on a regular Open WebUI install (tested on **0.11.4**). Everything runs inside
+your own Open WebUI: no external services and no extra packages.
 
 ---
 
@@ -45,6 +46,9 @@ This is not a fork. It runs on a regular Open WebUI install (tested on **0.11.4*
 **Safeguards:**
 - **Guard against wiping the note:** any edit that would discard more than half of the text is **refused**,
   unless the model confirms you explicitly asked for it. Even then, the previous version stays in the history.
+- **Only the note you are on:** in the chat next to a note, only that note can be changed. Other notes stay
+  readable, but an edit aimed at them is refused, because models sometimes "fix" look-alike notes too. You
+  can turn this off with the tool's `lock_to_current_note` valve.
 - **All or nothing:** if one edit in a batch fails, none is applied.
 - **Diff card on every edit:** only you see it; the model gets a short summary, which saves tokens. It has
   **Undo** and **History** buttons, which only fill in the message box.
@@ -54,10 +58,12 @@ This is not a fork. It runs on a regular Open WebUI install (tested on **0.11.4*
 ## Installation
 
 1. **Tool:** *Workspace → Tools → +*. Delete the example, paste `src/notes_canvas.py` and **Save**.
+   Or, as an admin, use **Import From Link** in the same menu with the file's GitHub URL.
    - Keep the id `notes_canvas`. If you use another id, the filter finds the tool anyway.
    - **Multi-user instances:** also give your users **read access** to the tool (its *Access* setting). Open
      WebUI drops tools a user can't access.
-2. **Filter:** *Admin Panel → Functions → +*. Paste `src/notes_canvas_activator.py` and **Save**.
+2. **Filter:** *Admin Panel → Functions → +*. Paste `src/notes_canvas_activator.py` (or import it from its
+   link) and **Save**.
    - In the Functions list, **enable** it.
    - In its menu (⋯), turn on **Global**. Without Global, it doesn't run.
 3. **Remove or disable** other note-editing tools, so the model isn't confused.
@@ -67,6 +73,26 @@ This is not a fork. It runs on a regular Open WebUI install (tested on **0.11.4*
    To change a specific passage, **select it in the editor** first.
 
 The model must support tool calling in **Native** mode, which is Open WebUI's default.
+
+### Updating
+
+Paste the new code over the old one in the same tool and function, and save. Cards already in old chat
+messages keep the code they were created with, so check an update in a **new** chat.
+
+---
+
+## Using it
+
+In the chat next to a note, just talk to the model:
+
+| You say | What happens |
+|---|---|
+| *(select a sentence)* "make this more formal" | Only that sentence changes. A card shows the diff, with **Undo** and **History**. |
+| "fix the typos in the second paragraph and bold the title" | Several edits in one call, saved as a single version. |
+| `/suggest-edits` | A card with numbered suggestions. Uncheck the ones you don't want, click **Apply checked** and press Enter. |
+| "keep writing, two more paragraphs" | New text goes at the end; nothing else is touched. |
+| "undo" · "show the history" · "restore version 3" | Goes back, lists the versions, restores one. |
+| *(in a regular chat)* "open a canvas called Trip plan" | Creates or reopens the note and replies with its link. |
 
 ### Shortcuts
 
@@ -81,6 +107,14 @@ The model must support tool calling in **Native** mode, which is Open WebUI's de
 
 They all act on the **selected passage** or, with no selection, on the whole note.
 
+### Tool settings
+
+Open them in *Workspace → Tools → Notes Canvas → ⚙ Valves*:
+
+| Valve | Default | Effect |
+|---|---|---|
+| `lock_to_current_note` | on | In a note's chat, only that note can be changed. Turn it off to let a note chat edit other notes too (e.g. a running summary kept in another note). |
+
 ### Filter settings
 
 Open them in *Functions → Notes Canvas Activator → ⚙ Valves*:
@@ -89,7 +123,19 @@ Open them in *Functions → Notes Canvas Activator → ⚙ Valves*:
 |---|---|---|
 | `tool_id` | `notes_canvas` | Id the tool was saved with. If no tool has this id, it is looked up by its functions. |
 | `mode` | `notes` | `notes`: Notes Canvas only in the chat next to a note. `always`: in every chat, so a regular chat can safely edit notes too. `always` costs a few extra tokens per message. |
-| `rules` | on | Appends the short editing rules in note chats. |
+| `rules` | on | Appends the short editing rules in note chats, including the id of the chat's note. |
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| The model answers with a plain-text list or rewrites the note; no cards | The filter is not running. In *Admin Panel → Functions*, the activator must be both **enabled** (toggle on) and **Global**. |
+| Works for admins but not for other users | Users need **read access** to the tool (the tool's *Access* setting). |
+| The model never calls any tool | Use a model that supports tool calling, with *Function Calling* set to **Native** (the default). |
+| "Passage not found" | The note changed or the passage was paraphrased. The model gets similar lines back and usually retries on its own. |
+| "This chat is attached to the note…" | The model tried to change another note from a note chat. That's the `lock_to_current_note` valve at work. |
 
 ---
 
@@ -130,6 +176,10 @@ python tests/test_integration.py
 
 The second one needs the `open_webui` package installed in that Python. It recreates a throwaway database in
 `tests/tmp/`, which Git ignores.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

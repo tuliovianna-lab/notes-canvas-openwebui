@@ -2,7 +2,7 @@
 title: Notes Canvas
 author: Túlio Vianna
 author_url: https://github.com/tuliovianna-lab/notes-canvas-openwebui
-version: 1.0.0
+version: 1.1.0
 license: MIT
 required_open_webui_version: 0.11.0
 description: Turns Open WebUI Notes into a ChatGPT-Canvas-style editor that works with any model. The model edits only the right passage, found by its own text (your editor selection works as-is, even across formatting), or proposes numbered suggestions you pick from. Every change shows a red/green diff card with Undo, and the last 10 versions can be restored. Pair it with the "Notes Canvas Activator" filter.
@@ -38,6 +38,7 @@ import unicodedata
 from typing import Optional
 
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 META_KEY = "notes_canvas"  # where history and suggestions live, inside note.meta
 MAX_VERSIONS = 10
@@ -530,8 +531,10 @@ button:hover { background:#8881; }
 .sug .snippet { margin:4px 0; }
 """
 
-# No "&" here either: no "&&" and no entities.
+# No "&" here either: no "&&" and no entities. Everything runs inside a
+# function so no name can clash with browser globals (e.g. `top`, `name`).
 _CARD_JS = """
+(function () {
 function el(tag, cls, text) {
   var e = document.createElement(tag);
   if (cls) { e.className = cls; }
@@ -562,10 +565,10 @@ function parts(box, list) {
   });
 }
 var c = document.getElementById('card');
-var top = el('div', 'top');
-top.appendChild(el('span', '', D.title));
-top.appendChild(el('small', '', D.subtitle));
-c.appendChild(top);
+var header = el('div', 'top');
+header.appendChild(el('span', '', D.title));
+header.appendChild(el('small', '', D.subtitle));
+c.appendChild(header);
 (D.snippets || []).forEach(function (s) {
   var d = el('div', 'snippet', '\\u2026');
   parts(d, s);
@@ -614,6 +617,7 @@ function reportHeight() {
 new ResizeObserver(reportHeight).observe(document.body);
 window.addEventListener('load', reportHeight);
 reportHeight();
+})();
 """
 
 
@@ -802,6 +806,47 @@ async def _resolve_note(ref: str, user: dict, permission: str):
     return found
 
 
+async def _chat_note_id(chat_id: Optional[str]) -> Optional[str]:
+    """Id of the note this chat is attached to (the chat next to a note), or None."""
+    if not chat_id:
+        return None
+    try:
+        from open_webui.models.chats import Chats
+
+        chat = await Chats.get_chat_by_id(chat_id)
+        meta = (chat.meta or {}) if chat else {}
+        if meta.get("internal") is True and meta.get("type") == "note":
+            return meta.get("note_id")
+    except Exception:
+        pass
+    return None
+
+
+async def _target_note(ref: str, user: dict, permission: str, chat_id: Optional[str], lock: bool):
+    """
+    Resolves the note to work on. In a note's chat, with `lock` on, only that
+    note can be used: a missing or ambiguous reference falls back to it, and a
+    reference to ANOTHER note is refused (models sometimes "fix" look-alike
+    notes too).
+    """
+    current = await _chat_note_id(chat_id) if lock else None
+    if not current:
+        return await _resolve_note(ref, user, permission)
+    try:
+        note = await _resolve_note(ref, user, permission)
+    except EditError:
+        note = None
+    if note is not None and note.id == current:
+        return note
+    own = await _resolve_note(current, user, permission)
+    if note is None:
+        return own
+    raise EditError(
+        f'This chat is attached to the note "{own.title}" (id: {own.id}); only that note can be changed here. '
+        f'Call again with note_id="{own.id}". Do not change other notes from this chat.'
+    )
+
+
 async def _save_meta(note, canvas: dict):
     """Saves only this tool's data (e.g. pending suggestions), without touching the text."""
     from open_webui.models.notes import NoteUpdateForm, Notes
@@ -915,10 +960,20 @@ def _read_edits(edits) -> list[tuple[str, str]]:
 
 
 class Tools:
-    def __init__(self):
-        pass
+    class Valves(BaseModel):
+        lock_to_current_note: bool = Field(
+            default=True,
+            description="In the chat next to a note, only that note can be changed (other notes stay readable). "
+            "Turn off to let a note chat edit other notes too.",
+        )
 
-    async def view_note(self, note_id: str, section: str = "", __user__: dict = None) -> str:
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def _note(self, ref: str, user: Optional[dict], permission: str, chat_id: Optional[str]):
+        return await _target_note(ref, user or {}, permission, chat_id, self.valves.lock_to_current_note)
+
+    async def view_note(self, note_id: str, section: str = "", __user__: dict = None, __chat_id__: str = None) -> str:
         """
         Reads a note: an outline of its sections and the EXACT text, to copy passages from when editing.
         For a long note, pass `section` to read only that part.
@@ -927,7 +982,13 @@ class Tools:
         :return: Outline and content of the note.
         """
         try:
-            n = await _resolve_note(note_id, __user__ or {}, "read")
+            try:
+                n = await _resolve_note(note_id, __user__ or {}, "read")
+            except EditError:
+                current = await _chat_note_id(__chat_id__)  # wrong reference in a note chat: read its note
+                if not current:
+                    raise
+                n = await _resolve_note(current, __user__ or {}, "read")
             md = _note_md(n)
             text = section_text(md, section) if section.strip() else md
             return (
@@ -948,6 +1009,7 @@ class Tools:
         confirm_large_change: bool = False,
         __user__: dict = None,
         __request__=None,
+        __chat_id__: str = None,
     ):
         """
         Edits a note by replacing ONLY the given passages, found by their text (not by position).
@@ -973,12 +1035,20 @@ class Tools:
                     raise EditError('Pass `edits`, for example [{"old": "current passage", "new": "new text"}].')
                 transform = lambda md: replace_with_detail(md, replacements)  # noqa: E731
                 action = "edit a passage" if len(replacements) == 1 else f"{len(replacements)} edits"
-            return await _edit(__request__, __user__ or {}, note_id, action, transform, confirm_large_change)
+            n = await self._note(note_id, __user__, "write", __chat_id__)
+            return await _edit(__request__, __user__ or {}, n, action, transform, confirm_large_change)
         except EditError as e:
             return f"ERROR: {e}"
 
     async def append_to_section(
-        self, note_id: str, section: str, text: str, position: str = "end", __user__: dict = None, __request__=None
+        self,
+        note_id: str,
+        section: str,
+        text: str,
+        position: str = "end",
+        __user__: dict = None,
+        __request__=None,
+        __chat_id__: str = None,
     ):
         """
         Appends a Markdown block inside an existing section, without touching the rest of the note.
@@ -993,7 +1063,7 @@ class Tools:
             return await _edit(
                 __request__,
                 __user__ or {},
-                note_id,
+                await self._note(note_id, __user__, "write", __chat_id__),
                 f'append to "{section}"',
                 lambda md: (append_in_section(md, section, text, position), f'block appended to "{section}"'),
             )
@@ -1008,6 +1078,7 @@ class Tools:
         confirm_large_change: bool = False,
         __user__: dict = None,
         __request__=None,
+        __chat_id__: str = None,
     ):
         """
         Replaces ALL the content of a section (subsections included), keeping its heading.
@@ -1022,7 +1093,7 @@ class Tools:
             return await _edit(
                 __request__,
                 __user__ or {},
-                note_id,
+                await self._note(note_id, __user__, "write", __chat_id__),
                 f'replace "{section}"',
                 lambda md: (replace_section_body(md, section, new_content), f'section "{section}" replaced'),
                 confirm_large_change,
@@ -1038,6 +1109,7 @@ class Tools:
         as_paragraph: bool = True,
         __user__: dict = None,
         __request__=None,
+        __chat_id__: str = None,
     ):
         """
         Adds new text without touching the existing text: at the end of the note or right after a passage.
@@ -1052,14 +1124,14 @@ class Tools:
             return await _edit(
                 __request__,
                 __user__ or {},
-                note_id,
+                await self._note(note_id, __user__, "write", __chat_id__),
                 "insert text",
                 lambda md: (insert_at(md, text, after, as_paragraph), "text inserted"),
             )
         except EditError as e:
             return f"ERROR: {e}"
 
-    async def suggest_edits(self, note_id: str, suggestions: list[dict], __user__: dict = None):
+    async def suggest_edits(self, note_id: str, suggestions: list[dict], __user__: dict = None, __chat_id__: str = None):
         """
         PROPOSES changes without applying any. The user sees them numbered in a card, checks the ones they want and asks to apply them.
         Use it when the user asks for suggestions, a review or feedback, instead of changing the text directly.
@@ -1069,7 +1141,7 @@ class Tools:
         :return: How many suggestions were stored and which ones failed.
         """
         try:
-            n = await _resolve_note(note_id, __user__ or {}, "write")
+            n = await self._note(note_id, __user__, "write", __chat_id__)
             valid, failed = validate_suggestions(_note_md(n), suggestions)
             if not valid:
                 return "ERROR: no suggestion could be stored.\n" + "\n".join(failed)
@@ -1085,7 +1157,12 @@ class Tools:
             return f"ERROR: {e}"
 
     async def apply_suggestions(
-        self, note_id: str, numbers: Optional[list[int]] = None, __user__: dict = None, __request__=None
+        self,
+        note_id: str,
+        numbers: Optional[list[int]] = None,
+        __user__: dict = None,
+        __request__=None,
+        __chat_id__: str = None,
     ):
         """
         Applies suggestions stored by suggest_edits without rewriting anything: it uses the text already proposed. All or nothing, as a single version.
@@ -1094,7 +1171,7 @@ class Tools:
         :return: Short confirmation or error.
         """
         try:
-            n = await _resolve_note(note_id, __user__ or {}, "write")
+            n = await self._note(note_id, __user__, "write", __chat_id__)
             items = _suggestions(n)
             chosen = pick_pending(items, numbers)
             replacements = [(s["old"], s["new"]) for s in chosen]
@@ -1115,7 +1192,9 @@ class Tools:
             hint = " The text changed since the suggestion: create new ones with suggest_edits." if str(e).startswith("Edit ") else ""
             return f"ERROR: {e}{hint}"
 
-    async def dismiss_suggestions(self, note_id: str, numbers: Optional[list[int]] = None, __user__: dict = None):
+    async def dismiss_suggestions(
+        self, note_id: str, numbers: Optional[list[int]] = None, __user__: dict = None, __chat_id__: str = None
+    ):
         """
         Dismisses pending suggestions (the text does not change).
         :param note_id: The note id (or its title).
@@ -1123,7 +1202,7 @@ class Tools:
         :return: Short confirmation.
         """
         try:
-            n = await _resolve_note(note_id, __user__ or {}, "write")
+            n = await self._note(note_id, __user__, "write", __chat_id__)
             items = _suggestions(n)
             chosen = pick_pending(items, numbers)
             new_items = mark(items, chosen, "dismissed")
@@ -1133,14 +1212,14 @@ class Tools:
         except EditError as e:
             return f"ERROR: {e}"
 
-    async def undo_last_edit(self, note_id: str, __user__: dict = None, __request__=None):
+    async def undo_last_edit(self, note_id: str, __user__: dict = None, __request__=None, __chat_id__: str = None):
         """
         Restores the note to its state before the last edit made by this tool.
         :param note_id: The note id (or its title).
         :return: Short confirmation or error.
         """
         try:
-            n = await _resolve_note(note_id, __user__ or {}, "write")
+            n = await self._note(note_id, __user__, "write", __chat_id__)
             versions = _versions(n)
             if not versions:
                 return "ERROR: there are no previous versions stored for this note."
@@ -1154,14 +1233,14 @@ class Tools:
         except EditError as e:
             return f"ERROR: {e}"
 
-    async def show_history(self, note_id: str, __user__: dict = None):
+    async def show_history(self, note_id: str, __user__: dict = None, __chat_id__: str = None):
         """
         Shows the user the previous versions stored by this tool (up to 10), with buttons to restore them.
         :param note_id: The note id (or its title).
         :return: Short list of the versions.
         """
         try:
-            n = await _resolve_note(note_id, __user__ or {}, "read")
+            n = await self._note(note_id, __user__, "read", __chat_id__)
             versions = _versions(n)
             if not versions:
                 return "There are no stored versions for this note yet."
@@ -1175,7 +1254,9 @@ class Tools:
         except EditError as e:
             return f"ERROR: {e}"
 
-    async def restore_version(self, note_id: str, number: int, __user__: dict = None, __request__=None):
+    async def restore_version(
+        self, note_id: str, number: int, __user__: dict = None, __request__=None, __chat_id__: str = None
+    ):
         """
         Restores a version from the history (1 = the most recent). The current state becomes a new version, so it can be reverted.
         :param note_id: The note id (or its title).
@@ -1183,7 +1264,7 @@ class Tools:
         :return: Short confirmation or error.
         """
         try:
-            n = await _resolve_note(note_id, __user__ or {}, "write")
+            n = await self._note(note_id, __user__, "write", __chat_id__)
             versions = _versions(n)
             if not 1 <= int(number) <= len(versions):
                 return f"ERROR: pick a number from 1 to {len(versions)}." if versions else "ERROR: there are no stored versions."
